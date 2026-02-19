@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Page Precision OCR</title>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+    <style>
+        :root { --primary: #10b981; --bg: #0f172a; --panel: #1e293b; }
+        
+        body { 
+            font-family: system-ui, -apple-system, sans-serif; 
+            background: var(--bg); 
+            color: white; 
+            margin: 0; 
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .header-panel {
+            background: var(--panel);
+            padding: 20px;
+            border-radius: 12px;
+            width: 90%;
+            max-width: 1000px;
+            position: sticky;
+            top: 10px;
+            z-index: 1000;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            border: 1px solid #334155;
+        }
+
+        #status { color: var(--primary); font-weight: bold; }
+
+        #viewer-container {
+            margin-top: 30px;
+            display: flex;
+            flex-direction: column;
+            gap: 40px;
+            width: 100%;
+            align-items: center;
+        }
+
+        .page-wrapper {
+            position: relative;
+            background: white;
+            box-shadow: 0 0 30px rgba(0,0,0,0.5);
+            cursor: crosshair;
+            line-height: 0;
+        }
+
+        /* Selection Rectangle UI */
+        #selection-rect {
+            position: absolute;
+            border: 2px solid var(--primary);
+            background: rgba(16, 185, 129, 0.2);
+            pointer-events: none;
+            display: none;
+            z-index: 9999;
+        }
+
+        #toast {
+            position: fixed;
+            bottom: 30px;
+            background: var(--primary);
+            color: white;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: bold;
+            display: none;
+            z-index: 10000;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        }
+
+        canvas { display: block; max-width: 100%; }
+        #crop-canvas { display: none; } /* Hidden processing canvas */
+        
+        input[type="file"] {
+            color: #94a3b8;
+        }
+    </style>
+</head>
+<body>
+
+<div class="header-panel">
+    <div>
+        <h2 style="margin: 0 0 5px 0;">Precision OCR</h2>
+        <input type="file" id="file-input" accept="application/pdf">
+    </div>
+    <div id="status">Waiting for PDF...</div>
+</div>
+
+<div id="viewer-container"></div>
+<div id="selection-rect"></div>
+<div id="toast">Copied to Clipboard!</div>
+<canvas id="crop-canvas"></canvas>
+
+<script>
+    const pdfjsLib = window['pdfjs-dist/build/pdf'];
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+
+    const fileInput = document.getElementById('file-input');
+    const viewer = document.getElementById('viewer-container');
+    const status = document.getElementById('status');
+    const selRect = document.getElementById('selection-rect');
+    const toast = document.getElementById('toast');
+    const cropCanvas = document.getElementById('crop-canvas');
+
+    let worker = null;
+    let isDrawing = false;
+    let startX, startY;
+    let currentActiveWrapper = null;
+
+    // Initialize the OCR Engine
+    async function initTesseract() {
+        status.innerText = "Loading AI Engine...";
+        worker = await Tesseract.createWorker('eng');
+        await worker.setParameters({
+            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";:/.,-?!()$@#%&* \n',
+            tessedit_pageseg_mode: '6', // Treat the crop as a single block
+        });
+        status.innerText = "Ready. Upload a PDF.";
+    }
+    initTesseract();
+
+    fileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        viewer.innerHTML = "";
+        status.innerText = "Processing PDF Pages...";
+
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+
+        for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const scale = 2.0; // Display quality
+            const viewport = page.getViewport({ scale });
+
+            // Create Page UI
+            const wrapper = document.createElement('div');
+            wrapper.className = 'page-wrapper';
+            wrapper.style.width = viewport.width + 'px';
+            wrapper.style.height = viewport.height + 'px';
+
+            const canvas = document.createElement('canvas');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            const ctx = canvas.getContext('2d');
+            
+            wrapper.appendChild(canvas);
+            viewer.appendChild(wrapper);
+
+            await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+
+            // Attach unique event listeners for this specific page
+            attachInteraction(wrapper, canvas);
+        }
+        status.innerText = "✅ Done. Draw boxes on any page to copy.";
+    });
+
+    function attachInteraction(wrapper, pageCanvas) {
+        wrapper.addEventListener('mousedown', (e) => {
+            isDrawing = true;
+            currentActiveWrapper = wrapper;
+            const rect = wrapper.getBoundingClientRect();
+            
+            // Mouse position relative to the page
+            startX = e.clientX - rect.left;
+            startY = e.clientY - rect.top;
+
+            selRect.style.display = 'block';
+            selRect.style.width = '0px';
+            selRect.style.height = '0px';
+            selRect.style.left = e.pageX + 'px';
+            selRect.style.top = e.pageY + 'px';
+        });
+
+        // Window listeners handle the "drag" and "release" accurately
+        const handleMouseMove = (e) => {
+            if (!isDrawing || currentActiveWrapper !== wrapper) return;
+
+            const rect = wrapper.getBoundingClientRect();
+            const currentX = Math.max(0, Math.min(e.clientX - rect.left, wrapper.clientWidth));
+            const currentY = Math.max(0, Math.min(e.clientY - rect.top, wrapper.clientHeight));
+
+            const width = Math.abs(currentX - startX);
+            const height = Math.abs(currentY - startY);
+            
+            // Adjust selection box position
+            const visualLeft = Math.min(currentX, startX) + rect.left + window.scrollX;
+            const visualTop = Math.min(currentY, startY) + rect.top + window.scrollY;
+
+            selRect.style.width = width + 'px';
+            selRect.style.height = height + 'px';
+            selRect.style.left = visualLeft + 'px';
+            selRect.style.top = visualTop + 'px';
+        };
+
+        const handleMouseUp = async (e) => {
+            if (!isDrawing || currentActiveWrapper !== wrapper) return;
+            isDrawing = false;
+            selRect.style.display = 'none';
+
+            const rect = wrapper.getBoundingClientRect();
+            const endX = Math.max(0, Math.min(e.clientX - rect.left, wrapper.clientWidth));
+            const endY = Math.max(0, Math.min(e.clientY - rect.top, wrapper.clientHeight));
+
+            // Final coordinates
+            const x = Math.min(startX, endX);
+            const y = Math.min(startY, endY);
+            const w = Math.abs(endX - startX);
+            const h = Math.abs(endY - startY);
+
+            if (w < 10 || h < 10) return; // Prevent tiny accidental boxes
+
+            status.innerText = "⚡ Analyzing Selection...";
+
+            // Prepare the high-resolution crop
+            const zoom = 3; // 3x resolution boost for accuracy
+            cropCanvas.width = w * zoom;
+            cropCanvas.height = h * zoom;
+            const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
+
+            // Draw the specific region from the specific page
+            cropCtx.drawImage(pageCanvas, x, y, w, h, 0, 0, w * zoom, h * zoom);
+
+            // ACCURACY TWEAK: Thresholding to fix BOLD and ;/ characters
+            const imgData = cropCtx.getImageData(0, 0, cropCanvas.width, cropCanvas.height);
+            const d = imgData.data;
+            for (let i = 0; i < d.length; i += 4) {
+                const brightness = (d[i] + d[i+1] + d[i+2]) / 3;
+                // Threshold 190 thins out bold letters so they don't merge
+                const val = brightness < 190 ? 0 : 255;
+                d[i] = d[i+1] = d[i+2] = val;
+            }
+            cropCtx.putImageData(imgData, 0, 0);
+
+            // Run OCR
+            const { data: { text } } = await worker.recognize(cropCanvas);
+            
+            if (text && text.trim().length > 0) {
+                await navigator.clipboard.writeText(text.trim());
+                showToast();
+            }
+            status.innerText = "✅ Copied. Select another area.";
+        };
+
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+    }
+
+    function showToast() {
+        toast.style.display = 'block';
+        setTimeout(() => toast.style.display = 'none', 2000);
+    }
+</script>
+
+</body>
+</html>
